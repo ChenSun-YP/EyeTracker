@@ -1,7 +1,11 @@
+print('aa')
+
 import cv2
 import numpy as np
 import os
 import mediapipe as mp
+from mediapipe.tasks.python import vision
+from mediapipe.tasks.python.core import base_options
 import time
 import math
 from scipy.spatial.transform import Rotation as Rscipy
@@ -9,7 +13,8 @@ from collections import deque
 import pyautogui
 import threading
 import keyboard
-
+import urllib.request
+print('aa')
 # Screen and mouse control setup (from old script)
 MONITOR_WIDTH, MONITOR_HEIGHT = pyautogui.size()
 CENTER_X = MONITOR_WIDTH // 2
@@ -59,15 +64,41 @@ R_ref_nose = [None]
 R_ref_forehead = [None]
 calibration_nose_scale = None
 
-# Initialize MediaPipe FaceMesh
-mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(
-    static_image_mode=False,
-    max_num_faces=1,
-    refine_landmarks=True,
-    min_detection_confidence=0.5,
+# Download model if needed
+def get_face_landmarker_model():
+    """Download face_landmarker.task model if it doesn't exist"""
+    model_dir = os.path.join(os.path.dirname(__file__), 'models')
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, 'face_landmarker.task')
+    
+    if not os.path.exists(model_path):
+        print("[MediaPipe] Downloading face_landmarker.task model...")
+        model_url = "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/latest/face_landmarker.task"
+        try:
+            urllib.request.urlretrieve(model_url, model_path)
+            print(f"[MediaPipe] Model downloaded to {model_path}")
+        except Exception as e:
+            print(f"[MediaPipe] Failed to download model: {e}")
+            print("[MediaPipe] Please download manually from:")
+            print(f"  {model_url}")
+            raise
+    
+    return os.path.abspath(model_path)
+
+# Initialize MediaPipe FaceLandmarker (Tasks API)
+model_path = get_face_landmarker_model()
+base_options_instance = base_options.BaseOptions(model_asset_path=model_path)
+options = vision.FaceLandmarkerOptions(
+    base_options=base_options_instance,
+    running_mode=vision.RunningMode.VIDEO,
+    num_faces=1,
+    output_face_blendshapes=False,
+    output_facial_transformation_matrixes=False,
+    min_face_detection_confidence=0.5,
+    min_face_presence_confidence=0.5,
     min_tracking_confidence=0.5
 )
+face_landmarker = vision.FaceLandmarker.create_from_options(options)
 
 # === Open webcam ===
 cap = cv2.VideoCapture(0)
@@ -82,6 +113,7 @@ nose_indices = [4, 45, 275, 220, 440, 1, 5, 51, 281, 44, 274, 241,
 
 # ===== NEW: File writing for screen position =====
 screen_position_file = "C:/Storage/Google Drive/Software/EyeTracker3DPython/screen_position.txt"
+screen_position_file = "C:\coding\EyeTracker\Webcam3DTracker\screen_position.txt"
 
 def write_screen_position(x, y):
     """Write screen position to file, overwriting the same line"""
@@ -718,6 +750,9 @@ right_sphere_locked = False
 right_sphere_local_offset = None
 right_calibration_nose_scale = None
 
+# Frame counter for video timestamp (must be monotonically increasing)
+frame_count = 0
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -725,11 +760,19 @@ while cap.isOpened():
 
     combined_dir = None  # will be filled once you compute a smoothed direction
 
+    # Convert frame to MediaPipe Image format
     frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    results = face_mesh.process(frame_rgb)
+    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=frame_rgb)
+    
+    # Process with FaceLandmarker (Tasks API)
+    # Timestamp must be monotonically increasing for video mode
+    frame_count += 1
+    timestamp_ms = frame_count * 33  # ~30fps = 33ms per frame
+    result = face_landmarker.detect_for_video(mp_image, timestamp_ms)
 
-    if results.multi_face_landmarks:
-        face_landmarks = results.multi_face_landmarks[0].landmark
+    if result.face_landmarks:
+        # Tasks API returns landmarks directly as a list
+        face_landmarks = result.face_landmarks[0]
 
         # Index for left iris center point (from MediaPipe's iris model)
         left_iris_idx = 468
@@ -862,8 +905,8 @@ while cap.isOpened():
 
         # Build 3D landmarks in your existing scale (x*w, y*h, z*w)
         landmarks3d = None
-        if results.multi_face_landmarks:
-            lm = results.multi_face_landmarks[0].landmark
+        if result.face_landmarks:
+            lm = result.face_landmarks[0]
             landmarks3d = np.array([[p.x * w, p.y * h, p.z * w] for p in lm], dtype=float)
 
         render_debug_view_orbit(
